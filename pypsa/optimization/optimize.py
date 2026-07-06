@@ -45,6 +45,11 @@ from pypsa.optimization.constraints import (
     define_tangent_loss_constraints,
     define_total_supply_constraints,
 )
+from pypsa.optimization.effects import (
+    _priced_effect_terms,
+    build_effect_expression,
+    define_effect_limit,
+)
 from pypsa.optimization.expressions import StatisticExpressionsAccessor
 from pypsa.optimization.global_constraints import (
     define_growth_limit,
@@ -285,7 +290,10 @@ def build_cost_terms(
 
 
 def define_objective(
-    n: Network, sns: pd.Index, include_objective_constant: bool
+    n: Network,
+    sns: pd.Index,
+    include_objective_constant: bool,
+    objective_effect: str = "cost",
 ) -> None:
     """Define and write the optimization objective function.
 
@@ -314,6 +322,12 @@ def define_objective(
         Snapshots (and, for multi-investment, periods) over which to build the objective.
     include_objective_constant : bool
         Whether to include the objective constant as a variable in the objective function.
+    objective_effect : str, default "cost"
+        The effect to minimize. Defaults to the built-in cost effect,
+        which reproduces the standard objective. Any effect declared in
+        `n.effects` with coefficient sources can be used instead (e.g.
+        minimize "co2" subject to a cost cap via an `effect_limit` global
+        constraint on "cost").
 
     Notes
     -----
@@ -324,6 +338,23 @@ def define_objective(
     """
     weighted_cost: xr.DataArray | int
     m = n.model
+
+    if objective_effect != "cost":
+        if n.has_risk_preference:
+            msg = "CVaR is only supported with objective_effect='cost'."
+            raise NotImplementedError(msg)
+        n._objective_constant = 0.0
+        effect_capex, effect_opex = build_effect_expression(n, objective_effect, sns)
+        effect_terms = effect_capex + effect_opex
+        if not effect_terms:
+            msg = (
+                f"Objective effect '{objective_effect}' has no contributions. "
+                "Please make sure coefficient sources are assigned."
+            )
+            raise ValueError(msg)
+        m.objective = merge(effect_terms) if len(effect_terms) > 1 else effect_terms[0]
+        return
+
     # Separate lists to distinguish CAPEX and OPEX terms
     capex_terms = []
     opex_terms = []
@@ -390,7 +421,7 @@ def define_objective(
 
     cost_capex_terms, cost_opex_terms, is_quadratic = build_cost_terms(n, sns)
     capex_terms += cost_capex_terms
-    opex_terms += cost_opex_terms
+    opex_terms += cost_opex_terms + _priced_effect_terms(n, sns)
 
     if not (capex_terms or opex_terms):
         msg = (
@@ -501,6 +532,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         include_objective_constant: bool | None = None,
         committable_big_m: float | None = None,
         meshed_thresholds: Sequence[int] | None = None,
+        objective_effect: str = "cost",
         **kwargs: Any,
     ) -> tuple[str, str]:
         """Optimize the pypsa network using linopy.
@@ -570,6 +602,12 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         meshed_thresholds : Sequence[int] | None, default: None
             Thresholds for splitting buses into nodal-balance constraint groups by
             bus connectivity count. Defaults to ``[30, 100, 400]``.
+        objective_effect : str, default: "cost"
+            The effect to minimize. Defaults to the built-in cost effect
+            (the standard objective). Any effect declared in `n.effects`
+            with coefficient sources can be used instead, e.g. minimize
+            "co2" subject to a cost cap via an `effect_limit` global
+            constraint on "cost".
         **kwargs:
             Keyword argument used by `linopy.Model.solve`, such as `solver_name`,
             `problem_fn` or solver options directly passed to the solver.
@@ -614,6 +652,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             include_objective_constant=include_objective_constant,
             committable_big_m=committable_big_m,
             meshed_thresholds=meshed_thresholds,
+            objective_effect=objective_effect,
             **model_kwargs,
         )
         if extra_functionality:
@@ -650,6 +689,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         include_objective_constant: bool | None = None,
         committable_big_m: float | None = None,
         meshed_thresholds: Sequence[int] | None = None,
+        objective_effect: str = "cost",
         **kwargs: Any,
     ) -> Model:
         """Create a linopy.Model instance from a pypsa network.
@@ -692,6 +732,10 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         meshed_thresholds : Sequence[int] | None, default: None
             Thresholds for splitting buses into nodal-balance constraint groups by
             bus connectivity count. Defaults to ``[30, 100, 400]``.
+        objective_effect : str, default: "cost"
+            The effect to minimize. Defaults to the built-in cost effect
+            (the standard objective). Any effect declared in `n.effects`
+            with coefficient sources can be used instead.
         **kwargs:
             Keyword arguments used by `linopy.Model()`, such as `solver_dir` or `chunk`.
 
@@ -853,8 +897,9 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         define_operational_limit(n, sns)
         define_nominal_constraints_per_bus_carrier(n, sns)
         define_growth_limit(n, sns)
+        define_effect_limit(n, sns)
 
-        define_objective(n, sns, include_objective_constant)
+        define_objective(n, sns, include_objective_constant, objective_effect)
 
         return n.model
 

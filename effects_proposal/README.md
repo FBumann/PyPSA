@@ -1,5 +1,28 @@
 # fluxopt → PyPSA core: Effect system proposal (capability A)
 
+**Status (2026-07-06): all four stages implemented as sequential commits on
+this fork's master** — so the full system can be judged working before
+deciding what to file upstream (e.g. only PR 1, or a rewrite):
+
+1. `Stage 0` — design docs + PoC shim (`poc_effects_shim.py`), equivalence
+   checks E1–E4 all passing.
+2. `Stage 1` — `Effect` component + `n.statistics.effect` (per-asset,
+   time-resolved, IO round-trip). No optimization-side changes.
+3. `Stage 2` — pure refactor: `build_cost_terms` +
+   `_carrier_contribution_terms` extracted, composed in
+   `pypsa/optimization/effects.py::build_effect_expression`. Objective and
+   GlobalConstraint expressions proven term-for-term identical on six
+   networks (incl. stochastic, multi-invest, non-cyclic storage).
+4. `Stage 3` — `effect_limit` GlobalConstraint type, `objective_effect=`
+   on `optimize()`, `Effect.price` coupling (≡ PyPSA-Eur emission-price
+   folding), `materialized_effects` closure. 18 tests in
+   `test/test_effects.py`; full optimization/statistics/IO suites green.
+
+Not implemented (deliberate MVP fence): stochastic-scenario effects,
+time-varying prices, per-hour bounds, status/startup channels, direct
+per-component `effect_coefficients` container, general contribution DAGs.
+
+
 Follow-up design pass on the handoff brief "Bringing fluxopt's modeling
 paradigm into PyPSA core". Produced 2026-07-06 against PyPSA master
 @ b43e70dd (v1.2.4 released), branch `origin/feat/piecewiese`, fluxopt

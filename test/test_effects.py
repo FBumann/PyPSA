@@ -30,13 +30,36 @@ def n_basic():
     n.add("Carrier", "coal", co2_emissions=0.34)
     n.add("Carrier", "wind")
     n.add("Bus", "b")
-    n.add("Generator", "gas", bus="b", carrier="gas", p_nom=100, marginal_cost=50,
-          efficiency=0.55)
-    n.add("Generator", "coal", bus="b", carrier="coal", p_nom=80, marginal_cost=30,
-          efficiency=0.40)
-    n.add("Generator", "wind", bus="b", carrier="wind", p_nom=120, marginal_cost=0.1,
-          p_max_pu=0.3 + 0.5 * np.sin(np.linspace(0, 3 * np.pi, 12)) ** 2)
-    n.add("Load", "load", bus="b", p_set=90 + 30 * np.cos(np.linspace(0, 2 * np.pi, 12)))
+    n.add(
+        "Generator",
+        "gas",
+        bus="b",
+        carrier="gas",
+        p_nom=100,
+        marginal_cost=50,
+        efficiency=0.55,
+    )
+    n.add(
+        "Generator",
+        "coal",
+        bus="b",
+        carrier="coal",
+        p_nom=80,
+        marginal_cost=30,
+        efficiency=0.40,
+    )
+    n.add(
+        "Generator",
+        "wind",
+        bus="b",
+        carrier="wind",
+        p_nom=120,
+        marginal_cost=0.1,
+        p_max_pu=0.3 + 0.5 * np.sin(np.linspace(0, 3 * np.pi, 12)) ** 2,
+    )
+    n.add(
+        "Load", "load", bus="b", p_set=90 + 30 * np.cos(np.linspace(0, 2 * np.pi, 12))
+    )
     n.snapshot_weightings.loc[:, :] = 2.0
     n.add("Effect", "co2", unit="tCO2", carrier_attribute="co2_emissions")
     return n
@@ -54,7 +77,9 @@ def manual_co2(n):
         .sum()
         .sum()
     )
-    sus = n.storage_units.query("carrier in @coeffs.index and not cyclic_state_of_charge")
+    sus = n.storage_units.query(
+        "carrier in @coeffs.index and not cyclic_state_of_charge"
+    )
     if not sus.empty:
         em = coeffs[sus.carrier].set_axis(sus.index)
         soc_final = n.storage_units_t.state_of_charge[sus.index].iloc[-1]
@@ -81,14 +106,18 @@ def test_effect_io_roundtrip(tmp_path):
     n.export_to_netcdf(path)
     m = pypsa.Network(path)
     pd.testing.assert_frame_equal(m.effects, n.effects)
-    pd.testing.assert_frame_equal(m.effects_t.price, n.effects_t.price, check_freq=False)
+    pd.testing.assert_frame_equal(
+        m.effects_t.price, n.effects_t.price, check_freq=False
+    )
 
     csv_path = tmp_path / "csvdir"
     n.export_to_csv_folder(csv_path)
     m = pypsa.Network()
     m.import_from_csv_folder(csv_path)
     pd.testing.assert_frame_equal(m.effects, n.effects)
-    pd.testing.assert_frame_equal(m.effects_t.price, n.effects_t.price, check_freq=False)
+    pd.testing.assert_frame_equal(
+        m.effects_t.price, n.effects_t.price, check_freq=False
+    )
 
 
 def test_effect_statistic_matches_manual(n_basic):
@@ -112,9 +141,17 @@ def test_effect_statistic_per_asset(n_basic):
 def test_effect_statistic_storage_depletion(n_basic):
     n = n_basic
     n.add("Carrier", "emitting_storage", co2_emissions=0.15)
-    n.add("StorageUnit", "gs", bus="b", carrier="emitting_storage", p_nom=40,
-          max_hours=6, state_of_charge_initial=100,
-          cyclic_state_of_charge=False, marginal_cost=1.0)
+    n.add(
+        "StorageUnit",
+        "gs",
+        bus="b",
+        carrier="emitting_storage",
+        p_nom=40,
+        max_hours=6,
+        state_of_charge_initial=100,
+        cyclic_state_of_charge=False,
+        marginal_cost=1.0,
+    )
     n.optimize()
     res = n.statistics.effect("co2")
     assert ("StorageUnit", "emitting_storage") in res.index
@@ -129,9 +166,18 @@ def test_effect_statistic_multiinvest():
     n.add("Carrier", "gas", co2_emissions=0.2)
     n.add("Bus", "b")
     for period in n.investment_periods:
-        n.add("Generator", f"gas-{period}", bus="b", carrier="gas",
-              build_year=period, lifetime=30, p_nom_extendable=True,
-              capital_cost=1000, marginal_cost=50, efficiency=0.55)
+        n.add(
+            "Generator",
+            f"gas-{period}",
+            bus="b",
+            carrier="gas",
+            build_year=period,
+            lifetime=30,
+            p_nom_extendable=True,
+            capital_cost=1000,
+            marginal_cost=50,
+            efficiency=0.55,
+        )
     n.add("Load", "load", bus="b", p_set=pd.Series(100.0, index=n.snapshots))
     n.add("Effect", "co2", unit="tCO2", carrier_attribute="co2_emissions")
     n.optimize(multi_investment_periods=True)
@@ -181,11 +227,25 @@ def test_build_effect_expression_matches_primary_energy(n_basic, with_storage):
     n = n_basic
     if with_storage:
         n.add("Carrier", "emitting_storage", co2_emissions=0.15)
-        n.add("StorageUnit", "gs", bus="b", carrier="emitting_storage", p_nom=40,
-              max_hours=6, state_of_charge_initial=100,
-              cyclic_state_of_charge=False, marginal_cost=1.0)
-    n.add("GlobalConstraint", "co2_cap", type="primary_energy",
-          carrier_attribute="co2_emissions", sense="<=", constant=1000.0)
+        n.add(
+            "StorageUnit",
+            "gs",
+            bus="b",
+            carrier="emitting_storage",
+            p_nom=40,
+            max_hours=6,
+            state_of_charge_initial=100,
+            cyclic_state_of_charge=False,
+            marginal_cost=1.0,
+        )
+    n.add(
+        "GlobalConstraint",
+        "co2_cap",
+        type="primary_energy",
+        carrier_attribute="co2_emissions",
+        sense="<=",
+        constant=1000.0,
+    )
     n.optimize.create_model()
 
     _, opex = build_effect_expression(n, "co2", n.snapshots)
@@ -211,13 +271,28 @@ def test_build_effect_expression_multiinvest_matches_primary_energy():
     n.add("Carrier", "gas", co2_emissions=0.2)
     n.add("Bus", "b")
     for period in n.investment_periods:
-        n.add("Generator", f"gas-{period}", bus="b", carrier="gas",
-              build_year=period, lifetime=30, p_nom_extendable=True,
-              capital_cost=1000, marginal_cost=50, efficiency=0.55)
+        n.add(
+            "Generator",
+            f"gas-{period}",
+            bus="b",
+            carrier="gas",
+            build_year=period,
+            lifetime=30,
+            p_nom_extendable=True,
+            capital_cost=1000,
+            marginal_cost=50,
+            efficiency=0.55,
+        )
     n.add("Load", "load", bus="b", p_set=pd.Series(100.0, index=n.snapshots))
     n.add("Effect", "co2", unit="tCO2", carrier_attribute="co2_emissions")
-    n.add("GlobalConstraint", "co2_cap", type="primary_energy",
-          carrier_attribute="co2_emissions", sense="<=", constant=1e6)
+    n.add(
+        "GlobalConstraint",
+        "co2_cap",
+        type="primary_energy",
+        carrier_attribute="co2_emissions",
+        sense="<=",
+        constant=1e6,
+    )
     n.optimize.create_model(multi_investment_periods=True)
 
     _, opex = build_effect_expression(n, "co2", n.snapshots)
@@ -226,6 +301,169 @@ def test_build_effect_expression_multiinvest_matches_primary_energy():
     pd.testing.assert_series_equal(
         _coeffs_by_var(expr), _coeffs_by_var(con.lhs), check_names=False
     )
+
+
+# --- Stage 3: effect_limit, price coupling, objective_effect, closure ---
+
+
+def test_effect_limit_equivalent_to_primary_energy(n_basic):
+    a = n_basic.copy()
+    a.add(
+        "GlobalConstraint",
+        "cap",
+        type="primary_energy",
+        carrier_attribute="co2_emissions",
+        sense="<=",
+        constant=500.0,
+    )
+    a.optimize()
+
+    b = n_basic.copy()
+    b.add(
+        "GlobalConstraint",
+        "cap",
+        type="effect_limit",
+        carrier_attribute="co2",
+        sense="<=",
+        constant=500.0,
+    )
+    b.optimize()
+
+    assert_allclose(a.objective, b.objective, rtol=1e-9)
+    assert_allclose(a.generators_t.p.values, b.generators_t.p.values, atol=1e-5)
+    assert_allclose(
+        float(a.global_constraints.loc["cap", "mu"]),
+        float(b.global_constraints.loc["cap", "mu"]),
+        rtol=1e-6,
+    )
+    assert float(b.global_constraints.loc["cap", "mu"]) != 0.0  # cap binds
+    assert_allclose(float(b.statistics.effect("co2").sum()), 500.0, rtol=1e-6)
+
+
+def test_effect_price_equivalent_to_marginal_cost_folding():
+    def build(objective_weight, energy_weight):
+        n = pypsa.Network(snapshots=pd.date_range("2026-01-01", periods=12, freq="h"))
+        n.add("Carrier", "gas", co2_emissions=0.2)
+        n.add("Carrier", "coal", co2_emissions=0.34)
+        n.add("Bus", "b")
+        n.add(
+            "Generator",
+            "gas",
+            bus="b",
+            carrier="gas",
+            p_nom=100,
+            marginal_cost=50,
+            efficiency=0.55,
+        )
+        n.add(
+            "Generator",
+            "coal",
+            bus="b",
+            carrier="coal",
+            p_nom=80,
+            marginal_cost=30,
+            efficiency=0.40,
+        )
+        n.add(
+            "Load",
+            "load",
+            bus="b",
+            p_set=90 + 30 * np.cos(np.linspace(0, 2 * np.pi, 12)),
+        )
+        n.snapshot_weightings["objective"] = objective_weight
+        n.snapshot_weightings["generators"] = energy_weight
+        return n
+
+    price = 60.0
+    # deliberately different objective and energy weightings: the priced
+    # contribution must inherit the objective weighting (like folding)
+    a = build(3.0, 2.0)
+    ep = a.carriers.co2_emissions[a.generators.carrier].set_axis(a.generators.index)
+    a.generators["marginal_cost"] += price * ep / a.generators.efficiency
+    a.optimize()
+
+    b = build(3.0, 2.0)
+    b.add("Effect", "co2", unit="tCO2", carrier_attribute="co2_emissions", price=price)
+    b.optimize()
+
+    assert_allclose(a.objective, b.objective, rtol=1e-9)
+    assert_allclose(a.generators_t.p.values, b.generators_t.p.values, atol=1e-5)
+
+
+def test_objective_effect_swap_with_cost_cap(n_basic):
+    base = n_basic.copy()
+    base.optimize()
+    cost_opt = base.objective
+    co2_costmin = float(base.statistics.effect("co2").sum())
+
+    n = n_basic.copy()
+    n.add(
+        "GlobalConstraint",
+        "cost_cap",
+        type="effect_limit",
+        carrier_attribute="cost",
+        sense="<=",
+        constant=1.05 * cost_opt,
+    )
+    n.optimize(objective_effect="co2")
+
+    co2_min = n.objective  # the objective *is* the co2 effect
+    assert co2_min <= co2_costmin * (1 + 1e-9)
+    assert_allclose(co2_min, float(n.statistics.effect("co2").sum()), rtol=1e-6)
+    # cost cap must bind (co2 can always be reduced by shifting to gas)
+    mu = float(n.global_constraints.loc["cost_cap", "mu"])
+    assert mu != 0.0
+
+
+def test_unbounded_effect_stays_out_of_model(n_basic):
+    from pypsa.optimization.effects import materialized_effects
+
+    a = n_basic.copy()  # co2 effect declared, unbounded, unpriced
+    a.add("Effect", "land_use", unit="ha")
+    a.optimize()
+
+    b = n_basic.copy()
+    b.remove("Effect", ["co2"])
+    b.optimize()
+
+    assert materialized_effects(a) == {"cost"}
+    assert not any(name.startswith("GlobalConstraint") for name in a.model.constraints)
+    assert_allclose(a.objective, b.objective, rtol=1e-12)
+    assert_allclose(a.generators_t.p.values, b.generators_t.p.values, atol=1e-9)
+
+
+def test_materialized_effects_closure(n_basic):
+    from pypsa.optimization.effects import materialized_effects
+
+    n = n_basic
+    n.add("Effect", "land_use", unit="ha")
+    n.add("Effect", "priced", unit="u", carrier_attribute="co2_emissions", price=1.0)
+    n.add(
+        "GlobalConstraint",
+        "cap",
+        type="effect_limit",
+        carrier_attribute="co2",
+        sense="<=",
+        constant=900.0,
+    )
+    # objective=cost: cost + bounded co2 + priced effect; land_use stays out
+    assert materialized_effects(n) == {"cost", "co2", "priced"}
+    # objective=co2 without any cost bound: priced effect no longer needed
+    assert materialized_effects(n.copy(), "co2") >= {"co2"}
+
+
+def test_effect_limit_unknown_effect_raises(n_basic):
+    n = n_basic
+    n.add(
+        "GlobalConstraint",
+        "cap",
+        type="effect_limit",
+        carrier_attribute="does_not_exist",
+        sense="<=",
+        constant=1.0,
+    )
+    with pytest.raises(ValueError, match="not defined in n.effects"):
+        n.optimize()
 
 
 def test_effect_statistic_unknown_effect(n_basic):
