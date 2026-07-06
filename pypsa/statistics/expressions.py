@@ -1700,6 +1700,136 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
         return df
 
     @MethodHandlerWrapper(handler_class=StatisticHandler, inject_attrs={"n": "_n"})
+    def effect(  # noqa: D417
+        self,
+        name: str,
+        components: str | Sequence[str] | None = None,
+        groupby_time: str | bool = "sum",
+        groupby_method: Callable | str = "sum",
+        aggregate_across_components: bool = False,
+        groupby: str | Sequence[str] | Callable | Literal[False] = "carrier",
+        at_port: PortsLike | None = None,
+        carrier: str | Sequence[str] | None = None,
+        bus_carrier: str | Sequence[str] | None = None,
+        nice_names: bool | None = None,
+        drop_zero: bool | None = None,
+        round: int | None = None,
+    ) -> pd.DataFrame:
+        """Calculate the per-component contributions to an effect.
+
+        Effects are named tracked quantities declared in `n.effects` (e.g.
+        CO2 emissions, primary energy, land use). For effects with
+        `carrier_attribute` set, contributions are computed with the same
+        semantics as the `primary_energy` global constraint: generator
+        output divided by efficiency times the carrier coefficient, plus
+        the depletion of non-cyclic storage units and stores. The result is
+        available for *all* declared effects, whether or not the effect is
+        bounded in the optimization.
+
+        Parameters
+        ----------
+        name : str
+            Name of the effect, must be present in `n.effects`.
+        components : str | Sequence[str] | None, default=None
+            Components to include. If None, includes all one-port and
+            branch components (only those covered by the effect's
+            coefficient sources contribute).
+        groupby : str | Sequence[str] | Callable | False, default="carrier"
+            How to group components. Use `False` for individual assets.
+
+        Returns
+        -------
+        pd.DataFrame
+            Effect contributions with components as rows and either time
+            steps as columns (if groupby_time=False) or a single column of
+            aggregated values.
+
+        """
+        effects = self._n.c.effects.static
+        if isinstance(effects.index, pd.MultiIndex):
+            effects = effects.groupby(level="name").first()
+        if name not in effects.index:
+            msg = (
+                f"Effect '{name}' is not defined in n.effects. "
+                f"Available effects: {list(effects.index)}."
+            )
+            raise ValueError(msg)
+        carrier_attribute = effects.at[name, "carrier_attribute"]
+        accounting = effects.at[name, "accounting"]
+        if not carrier_attribute:
+            msg = (
+                f"Effect '{name}' has no `carrier_attribute` set; there are "
+                "no coefficient sources to evaluate."
+            )
+            raise ValueError(msg)
+
+        w_flow_col = "generators" if accounting == "physical" else "objective"
+
+        @pass_empty_series_if_keyerror
+        def func(n: Network, c: str, port: str) -> pd.Series:
+            coeffs = n.c.carriers.static[carrier_attribute]
+            if isinstance(coeffs.index, pd.MultiIndex):
+                coeffs = coeffs.groupby(level="name").first()
+            coeffs = coeffs[coeffs != 0]
+            static = n.c[c].static
+            assets = static.index[static.carrier.isin(coeffs.index)]
+            if assets.empty:
+                return pd.Series()
+            em = coeffs[static.carrier[assets]].set_axis(assets)
+            weights_one = pd.Series(1.0, index=n.snapshots)
+
+            if c == "Generator":
+                eff = n.get_switchable_as_dense(c, "efficiency")[assets]
+                vals = n.c[c].dynamic["p"][assets] / eff * em
+                weights = n.snapshot_weightings[w_flow_col]
+                return self._aggregate_timeseries(vals, weights, agg=groupby_time)
+
+            if c == "StorageUnit":
+                sus = static.loc[assets].query("not cyclic_state_of_charge").index
+                if sus.empty:
+                    return pd.Series()
+                soc = n.c[c].dynamic["state_of_charge"][sus]
+                depletion = -soc.diff()
+                depletion.iloc[0] = (
+                    static.loc[sus, "state_of_charge_initial"] - soc.iloc[0]
+                )
+                vals = depletion * em[sus]
+                return self._aggregate_timeseries(vals, weights_one, agg=groupby_time)
+
+            if c == "Store":
+                sts = static.loc[assets].query("not e_cyclic").index
+                if sts.empty:
+                    return pd.Series()
+                e = n.c[c].dynamic["e"][sts]
+                depletion = -e.diff()
+                depletion.iloc[0] = static.loc[sts, "e_initial"] - e.iloc[0]
+                vals = depletion * em[sts]
+                return self._aggregate_timeseries(vals, weights_one, agg=groupby_time)
+
+            return pd.Series()
+
+        df = self._aggregate_components(
+            func,
+            components=components,
+            agg=groupby_method,
+            aggregate_across_components=aggregate_across_components,
+            groupby=groupby,
+            at_port=at_port,
+            carrier=carrier,
+            bus_carrier=bus_carrier,
+            nice_names=nice_names,
+            drop_zero=drop_zero,
+            round=round,
+        )
+        if self._n.has_investment_periods and not df.empty:
+            col = "years" if accounting == "physical" else "objective"
+            weights = self._n.investment_period_weightings[col]
+            df = df.multiply(weights, level="period")
+        df.attrs["name"] = f"Effect ({name})"
+        df.attrs["unit"] = effects.at[name, "unit"] or "unit"
+        return df
+
+    @MethodHandlerWrapper(handler_class=StatisticHandler, inject_attrs={"n": "_n"})
     @deprecated_kwargs(
         deprecated_in="1.0",
         removed_in="2.0",
