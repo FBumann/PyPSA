@@ -136,47 +136,35 @@ def _resolve_include_objective_constant(
     return value
 
 
-def define_objective(
-    n: Network, sns: pd.Index, include_objective_constant: bool
-) -> None:
-    """Define and write the optimization objective function.
+def build_cost_terms(
+    n: Network, sns: pd.Index
+) -> tuple[list[Any], list[Any], bool]:
+    """Build the capex and opex expression terms of the cost effect.
 
-    Builds the (linear or quadratic) objective by assembling the following terms:
-
-    1. **Constant term** for already-built capacity
-       Calculates capex of existing assets and stores it in `n.objective_constant`.
-    2. **Operating costs**
-       Marginal generation costs, storage operation costs, and spill costs weighted by snapshot durations.
-    3. **Quadratic costs**
-       If present, adds second-order marginal cost terms to convex quadratic objective.
-    4. **Stand-by costs**
-       Fixed costs for committed assets (e.g. generators and links) when online.
-    5. **Investment costs**
-       Capex for new capacity, weighted by investment periods if `n._multi_invest` is True.
-    6. **Unit-commitment costs**
-       Start-up and shut-down costs for committable components.
-    7. **Conditional CVaR terms**
-        Define auxiliary CVaR constraints for stochastic risk-averse optimization.
+    Assembles the operational (marginal, storage, spill, quadratic,
+    stand-by, start-up/shut-down) and investment cost terms exactly as the
+    objective uses them, weighted with the ``objective`` snapshot and
+    investment period weightings. The objective constant for existing
+    assets is *not* included; it is handled in
+    [define_objective][pypsa.optimization.optimize.define_objective].
 
     Parameters
     ----------
     n : pypsa.Network
-        Network instance containing the Linopy model and component data.
-    sns : pandas.Index
-        Snapshots (and, for multi-investment, periods) over which to build the objective.
-    include_objective_constant : bool
-        Whether to include the objective constant as a variable in the objective function.
+        The network to build cost terms for.
+    sns : pd.Index
+        Snapshots (and, for multi-investment, periods) over which to build
+        the terms.
 
-    Notes
-    -----
-    - The final objective expression is assigned to `n.model.objective`.
-    - Applies snapshot and investment-period weightings to operational and capex terms.
-    - For a stochastic problem, scenario probabilities are applied as weightings to all cost (includes *both* investment terms).
+    Returns
+    -------
+    tuple[list, list, bool]
+        Lists of capex and opex linopy expression terms, and whether any
+        term is quadratic.
 
     """
     weighted_cost: xr.DataArray | int
     m = n.model
-    # Separate lists to distinguish CAPEX and OPEX terms
     capex_terms = []
     opex_terms = []
     is_quadratic = False
@@ -184,62 +172,6 @@ def define_objective(
     if n._multi_invest:
         periods = sns.unique("period")
         period_weighting = n.investment_period_weightings.objective[periods]
-
-    # constant for already done investment
-    if include_objective_constant:
-        nom_attr = nominal_attrs.items()
-        constant: xr.DataArray | float = 0
-        terms = []
-
-        for c_name, attr in nom_attr:
-            c = as_components(n, c_name)
-            ext_i = c.extendables.difference(c.inactive_assets)
-
-            if ext_i.empty:
-                continue
-
-            periodic_cost = c.periodized_cost.sel(name=ext_i)
-            if periodic_cost.size == 0:
-                continue
-
-            nominal = c.da[attr].sel(name=ext_i)
-
-            if n._multi_invest:
-                weighted_cost = 0
-                for period in periods:
-                    active = c.da.active.sel(period=period, name=ext_i).any(
-                        dim="timestep"
-                    )
-                    weighted_cost += (
-                        active * periodic_cost * period_weighting.loc[period]
-                    )
-            else:
-                active = c.da.active.sel(name=ext_i).any(dim="snapshot")
-                weighted_cost = active * periodic_cost
-
-                terms.append((weighted_cost * nominal).sum(dim=["name"]))
-
-        constant += sum(terms)
-
-        # Handle constant for stochastic vs deterministic networks
-        if n.has_scenarios and isinstance(constant, xr.DataArray):
-            # For stochastic networks, weight constant by scenario probabilities
-            weighted_constant = sum(
-                constant.sel(scenario=s) * n.scenario_weightings.loc[s, "weight"]
-                for s in n.scenarios
-            )
-            n._objective_constant = float(weighted_constant)
-            has_const = (constant != 0).any().item()
-        else:
-            n._objective_constant = float(constant)
-            has_const = constant != 0
-        if has_const:
-            object_const = m.add_variables(
-                constant, constant, name="objective_constant"
-            )
-            capex_terms.append(-1 * object_const)
-    else:
-        n._objective_constant = 0.0
 
     # Weightings
     weighting = n.snapshot_weightings.objective
@@ -348,6 +280,117 @@ def define_objective(
 
         var = m[f"{c.name}-{attr}"].sel(name=com_i)
         opex_terms.append((var * cost).sum(dim=["name", "snapshot"]))
+
+    return capex_terms, opex_terms, is_quadratic
+
+
+def define_objective(
+    n: Network, sns: pd.Index, include_objective_constant: bool
+) -> None:
+    """Define and write the optimization objective function.
+
+    Builds the (linear or quadratic) objective by assembling the following terms:
+
+    1. **Constant term** for already-built capacity
+       Calculates capex of existing assets and stores it in `n.objective_constant`.
+    2. **Operating costs**
+       Marginal generation costs, storage operation costs, and spill costs weighted by snapshot durations.
+    3. **Quadratic costs**
+       If present, adds second-order marginal cost terms to convex quadratic objective.
+    4. **Stand-by costs**
+       Fixed costs for committed assets (e.g. generators and links) when online.
+    5. **Investment costs**
+       Capex for new capacity, weighted by investment periods if `n._multi_invest` is True.
+    6. **Unit-commitment costs**
+       Start-up and shut-down costs for committable components.
+    7. **Conditional CVaR terms**
+        Define auxiliary CVaR constraints for stochastic risk-averse optimization.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network instance containing the Linopy model and component data.
+    sns : pandas.Index
+        Snapshots (and, for multi-investment, periods) over which to build the objective.
+    include_objective_constant : bool
+        Whether to include the objective constant as a variable in the objective function.
+
+    Notes
+    -----
+    - The final objective expression is assigned to `n.model.objective`.
+    - Applies snapshot and investment-period weightings to operational and capex terms.
+    - For a stochastic problem, scenario probabilities are applied as weightings to all cost (includes *both* investment terms).
+
+    """
+    weighted_cost: xr.DataArray | int
+    m = n.model
+    # Separate lists to distinguish CAPEX and OPEX terms
+    capex_terms = []
+    opex_terms = []
+
+    if n._multi_invest:
+        periods = sns.unique("period")
+        period_weighting = n.investment_period_weightings.objective[periods]
+
+    # constant for already done investment
+    if include_objective_constant:
+        nom_attr = nominal_attrs.items()
+        constant: xr.DataArray | float = 0
+        terms = []
+
+        for c_name, attr in nom_attr:
+            c = as_components(n, c_name)
+            ext_i = c.extendables.difference(c.inactive_assets)
+
+            if ext_i.empty:
+                continue
+
+            periodic_cost = c.periodized_cost.sel(name=ext_i)
+            if periodic_cost.size == 0:
+                continue
+
+            nominal = c.da[attr].sel(name=ext_i)
+
+            if n._multi_invest:
+                weighted_cost = 0
+                for period in periods:
+                    active = c.da.active.sel(period=period, name=ext_i).any(
+                        dim="timestep"
+                    )
+                    weighted_cost += (
+                        active * periodic_cost * period_weighting.loc[period]
+                    )
+            else:
+                active = c.da.active.sel(name=ext_i).any(dim="snapshot")
+                weighted_cost = active * periodic_cost
+
+                terms.append((weighted_cost * nominal).sum(dim=["name"]))
+
+        constant += sum(terms)
+
+        # Handle constant for stochastic vs deterministic networks
+        if n.has_scenarios and isinstance(constant, xr.DataArray):
+            # For stochastic networks, weight constant by scenario probabilities
+            weighted_constant = sum(
+                constant.sel(scenario=s) * n.scenario_weightings.loc[s, "weight"]
+                for s in n.scenarios
+            )
+            n._objective_constant = float(weighted_constant)
+            has_const = (constant != 0).any().item()
+        else:
+            n._objective_constant = float(constant)
+            has_const = constant != 0
+        if has_const:
+            object_const = m.add_variables(
+                constant, constant, name="objective_constant"
+            )
+            capex_terms.append(-1 * object_const)
+    else:
+        n._objective_constant = 0.0
+
+    cost_capex_terms, cost_opex_terms, is_quadratic = build_cost_terms(n, sns)
+    capex_terms += cost_capex_terms
+    opex_terms += cost_opex_terms
 
     if not (capex_terms or opex_terms):
         msg = (

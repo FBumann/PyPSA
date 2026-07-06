@@ -152,6 +152,82 @@ def test_effect_statistic_multiinvest():
     assert_allclose(float(res.sum().sum()), manual, rtol=1e-6)
 
 
+def _coeffs_by_var(expr):
+    flat = expr.flat
+    return flat.groupby("vars").coeffs.sum().sort_index()
+
+
+def test_build_effect_expression_cost_matches_objective(n_basic):
+    from linopy import merge
+
+    from pypsa.optimization.effects import build_effect_expression
+
+    n = n_basic
+    n.optimize.create_model()
+    capex, opex = build_effect_expression(n, "cost", n.snapshots)
+    expr = merge(capex + opex) if capex else merge(opex)
+    pd.testing.assert_series_equal(
+        _coeffs_by_var(expr),
+        _coeffs_by_var(n.model.objective.expression),
+    )
+
+
+@pytest.mark.parametrize("with_storage", [False, True])
+def test_build_effect_expression_matches_primary_energy(n_basic, with_storage):
+    from linopy import merge
+
+    from pypsa.optimization.effects import build_effect_expression
+
+    n = n_basic
+    if with_storage:
+        n.add("Carrier", "emitting_storage", co2_emissions=0.15)
+        n.add("StorageUnit", "gs", bus="b", carrier="emitting_storage", p_nom=40,
+              max_hours=6, state_of_charge_initial=100,
+              cyclic_state_of_charge=False, marginal_cost=1.0)
+    n.add("GlobalConstraint", "co2_cap", type="primary_energy",
+          carrier_attribute="co2_emissions", sense="<=", constant=1000.0)
+    n.optimize.create_model()
+
+    _, opex = build_effect_expression(n, "co2", n.snapshots)
+    expr = merge(opex)
+    con = n.model.constraints["GlobalConstraint-co2_cap"]
+    pd.testing.assert_series_equal(
+        _coeffs_by_var(expr), _coeffs_by_var(con.lhs), check_names=False
+    )
+    # constants of the expression (storage initial SoC) are moved to the rhs
+    const = float(expr.const.sum()) if hasattr(expr, "const") else 0.0
+    assert_allclose(float(con.rhs), 1000.0 - const)
+
+
+def test_build_effect_expression_multiinvest_matches_primary_energy():
+    from linopy import merge
+
+    from pypsa.optimization.effects import build_effect_expression
+
+    n = pypsa.Network(snapshots=range(8))
+    n.investment_periods = [2030, 2040]
+    n.investment_period_weightings["years"] = [10.0, 10.0]
+    n.investment_period_weightings["objective"] = [10.0, 7.0]
+    n.add("Carrier", "gas", co2_emissions=0.2)
+    n.add("Bus", "b")
+    for period in n.investment_periods:
+        n.add("Generator", f"gas-{period}", bus="b", carrier="gas",
+              build_year=period, lifetime=30, p_nom_extendable=True,
+              capital_cost=1000, marginal_cost=50, efficiency=0.55)
+    n.add("Load", "load", bus="b", p_set=pd.Series(100.0, index=n.snapshots))
+    n.add("Effect", "co2", unit="tCO2", carrier_attribute="co2_emissions")
+    n.add("GlobalConstraint", "co2_cap", type="primary_energy",
+          carrier_attribute="co2_emissions", sense="<=", constant=1e6)
+    n.optimize.create_model(multi_investment_periods=True)
+
+    _, opex = build_effect_expression(n, "co2", n.snapshots)
+    expr = merge(opex)
+    con = n.model.constraints["GlobalConstraint-co2_cap"]
+    pd.testing.assert_series_equal(
+        _coeffs_by_var(expr), _coeffs_by_var(con.lhs), check_names=False
+    )
+
+
 def test_effect_statistic_unknown_effect(n_basic):
     n = n_basic
     with pytest.raises(ValueError, match="not defined in n.effects"):
