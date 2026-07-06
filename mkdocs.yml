@@ -110,6 +110,7 @@ nav:
     - examples/stochastic-optimization.ipynb
     - examples/mga.ipynb
     - examples/near-opt-space.ipynb
+    - examples/effects.ipynb
     - examples/modular-expansion.ipynb
     - examples/committable-extendable.ipynb
     - examples/modular-committable.ipynb
