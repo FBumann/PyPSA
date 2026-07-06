@@ -13,5 +13,6 @@ Transformer,transformers,"2-winding transformer.",passive_branch
 TransformerType,transformer_types,"Standard 2-winding transformer types.",standard_type
 ShuntImpedance,shunt_impedances,"Shunt with voltage-dependent admittance.",passive_one_port
 GlobalConstraint,global_constraints,"Constraints in the optimisation problem that apply to multiple components at once."
+Effect,effects,"Named tracked quantities (e.g. cost, CO2 emissions, primary energy, land use). Components contribute to effects via coefficients; effects can be reported per component, bounded via global constraints, priced into the objective, or serve as the objective."
 Shape,shapes,"Geographical shapes of network components.",shape
 SubNetwork,sub_networks,"Subsets of buses and passive branches (i.e. lines and transformers) that are connected (i.e. synchronous areas)."
