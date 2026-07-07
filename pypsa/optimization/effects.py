@@ -24,14 +24,133 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import pandas as pd
 from linopy.expressions import merge
 from numpy import isnan
+
+from pypsa.descriptors import nominal_attrs
 
 if TYPE_CHECKING:
     from pypsa import Network
 
 logger = logging.getLogger(__name__)
+
+
+def operational_effect_attr(effect: str) -> str:
+    """Column name of per-unit-of-operation coefficients for `effect`.
+
+    The per-component analog of `marginal_cost`: a static column
+    ``marginal_effect_{effect}`` on a component table contributes
+    `coefficient x operation` per snapshot to the effect (e.g. water use in
+    m3/MWh of one specific plant).
+    """
+    return f"marginal_effect_{effect}"
+
+
+def capacity_effect_attr(effect: str) -> str:
+    """Column name of per-unit-of-capacity coefficients for `effect`.
+
+    The per-component analog of `capital_cost`: a static column
+    ``capital_effect_{effect}`` on a component table contributes
+    `coefficient x nominal capacity` per active period to the effect (e.g.
+    land use in ha/MW).
+    """
+    return f"capital_effect_{effect}"
+
+
+def _has_direct_coefficients(n: Network, effect: str) -> bool:
+    cols = {operational_effect_attr(effect), capacity_effect_attr(effect)}
+    return any(
+        not cols.isdisjoint(n.c[c].static.columns)
+        for c in n.all_components
+        if not n.c[c].static.empty
+    )
+
+
+def _direct_effect_terms(
+    n: Network,
+    effect: str,
+    sns: pd.Index,
+    flow_weight_col: str,
+    period_weight_col: str,
+) -> tuple[list[Any], float]:
+    """Build terms from per-component coefficient columns.
+
+    Reads ``marginal_effect_{effect}`` (per unit of the component's
+    operational variable, snapshot-weighted like the corresponding
+    `marginal_cost` term) and ``capital_effect_{effect}`` (per unit of
+    nominal capacity and active period, like the `capital_cost` term but
+    without annuitization). Contributions of non-extendable capacity are
+    constants and returned separately.
+    """
+    from pypsa.optimization.optimize import lookup  # noqa: PLC0415
+
+    m = n.model
+    terms: list[Any] = []
+    constant = 0.0
+
+    if n._multi_invest:
+        periods = sns.unique("period")
+        period_weighting = n.investment_period_weightings[period_weight_col][periods]
+
+    # operational channel: coefficient x operation x snapshot weighting
+    weighting = n.snapshot_weightings[flow_weight_col]
+    if n._multi_invest:
+        weighting = weighting.mul(period_weighting, level=0)
+    weighting = weighting.loc[sns]
+
+    op_col = operational_effect_attr(effect)
+    for c_name, attr in lookup.query("marginal_cost").index:
+        c = n.c[c_name]
+        if c.static.empty or op_col not in c.static.columns:
+            continue
+        coeff = pd.to_numeric(c.static[op_col], errors="coerce").fillna(0.0)
+        assets = coeff.index[coeff != 0].difference(c.inactive_assets)
+        if assets.empty:
+            continue
+        em = pd.DataFrame(
+            np.outer(weighting.values, coeff[assets].values),
+            index=sns,
+            columns=assets,
+        ).rename_axis(columns="name")
+        var = m[f"{c_name}-{attr}"].sel(name=assets, snapshot=sns)
+        terms.append((var * em).sum())
+
+    # capacity channel: coefficient x nominal capacity x active periods
+    cap_col = capacity_effect_attr(effect)
+    for c_name, attr in nominal_attrs.items():
+        c = n.c[c_name]
+        if c.static.empty or cap_col not in c.static.columns:
+            continue
+        coeff = pd.to_numeric(c.static[cap_col], errors="coerce").fillna(0.0)
+        assets = coeff.index[coeff != 0].difference(c.inactive_assets)
+        if assets.empty:
+            continue
+        coeff_da = coeff[assets].rename_axis("name").to_xarray()
+        if n._multi_invest:
+            weighted_coeff = 0
+            for period in periods:
+                active = c.da.active.sel(period=period, name=assets).any(dim="timestep")
+                weighted_coeff = (
+                    weighted_coeff + active * coeff_da * period_weighting.loc[period]
+                )
+        else:
+            active = c.da.active.sel(name=assets).any(dim="snapshot")
+            weighted_coeff = active * coeff_da
+        ext = assets.intersection(c.extendables)
+        fix = assets.difference(c.extendables)
+        if not ext.empty:
+            terms.append(
+                (
+                    m[f"{c_name}-{attr}"].sel(name=ext) * weighted_coeff.sel(name=ext)
+                ).sum(dim=["name"])
+            )
+        if not fix.empty:
+            constant += float(
+                (weighted_coeff.sel(name=fix) * c.da[attr].sel(name=fix)).sum()
+            )
+    return terms, constant
 
 
 def _effects_static(n: Network) -> pd.DataFrame:
@@ -115,19 +234,32 @@ def _priced_effect_terms(n: Network, sns: pd.Index) -> list[Any]:
 
     terms = []
     for name, row in priced.iterrows():
-        if not row.carrier_attribute:
+        if not row.carrier_attribute and not _has_direct_coefficients(n, name):
             msg = (
-                f"Priced effect '{name}' has no `carrier_attribute` set; "
-                "there are no coefficient sources to price."
+                f"Priced effect '{name}' has no coefficient sources: neither "
+                f"`carrier_attribute` is set nor does any component carry "
+                f"`{operational_effect_attr(name)}` or "
+                f"`{capacity_effect_attr(name)}` columns."
             )
             raise ValueError(msg)
-        coeffs = n.c.carriers.static[row.carrier_attribute]
-        coeffs = coeffs[coeffs != 0]
-        if coeffs.empty:
-            continue
-        effect_terms = _carrier_effect_terms(
-            n, coeffs, sns, flow_weight_col="objective", period_weight_col="objective"
+        effect_terms = []
+        if row.carrier_attribute:
+            coeffs = n.c.carriers.static[row.carrier_attribute]
+            coeffs = coeffs[coeffs != 0]
+            if not coeffs.empty:
+                effect_terms += _carrier_effect_terms(
+                    n,
+                    coeffs,
+                    sns,
+                    flow_weight_col="objective",
+                    period_weight_col="objective",
+                )
+        direct_terms, direct_constant = _direct_effect_terms(
+            n, name, sns, "objective", "objective"
         )
+        effect_terms += direct_terms
+        if direct_constant and effect_terms:
+            effect_terms[-1] = effect_terms[-1] + direct_constant
         terms.extend(float(row.price) * term for term in effect_terms)
     return terms
 
@@ -184,28 +316,44 @@ def build_effect_expression(
 
     carrier_attribute = effects.at[name, "carrier_attribute"]
     accounting = effects.at[name, "accounting"]
-    if not carrier_attribute:
+    if not carrier_attribute and not _has_direct_coefficients(n, name):
         msg = (
-            f"Effect '{name}' has no `carrier_attribute` set; there are no "
-            "coefficient sources to build an expression from."
+            f"Effect '{name}' has no coefficient sources: neither "
+            f"`carrier_attribute` is set nor does any component carry "
+            f"`{operational_effect_attr(name)}` or "
+            f"`{capacity_effect_attr(name)}` columns."
         )
         raise ValueError(msg)
-
-    coeffs = n.c.carriers.static[carrier_attribute]
-    coeffs = coeffs[coeffs != 0]
-    if coeffs.empty:
-        return [], []
 
     period_weight_col = "years" if accounting == "physical" else "objective"
     flow_weight_col = "generators" if accounting == "physical" else "objective"
 
-    opex_terms = _carrier_effect_terms(
-        n,
-        coeffs,
-        sns,
-        flow_weight_col=flow_weight_col,
-        period_weight_col=period_weight_col,
+    opex_terms = []
+    if carrier_attribute:
+        coeffs = n.c.carriers.static[carrier_attribute]
+        coeffs = coeffs[coeffs != 0]
+        if not coeffs.empty:
+            opex_terms += _carrier_effect_terms(
+                n,
+                coeffs,
+                sns,
+                flow_weight_col=flow_weight_col,
+                period_weight_col=period_weight_col,
+            )
+
+    direct_terms, direct_constant = _direct_effect_terms(
+        n, name, sns, flow_weight_col, period_weight_col
     )
+    opex_terms += direct_terms
+    if direct_constant:
+        if opex_terms:
+            opex_terms[-1] = opex_terms[-1] + direct_constant
+        else:
+            logger.warning(
+                "Effect '%s' only has constant contributions from "
+                "non-extendable capacity; they cannot enter the model.",
+                name,
+            )
     return [], opex_terms
 
 

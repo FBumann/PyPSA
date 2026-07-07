@@ -475,5 +475,130 @@ def test_effect_statistic_unknown_effect(n_basic):
 def test_effect_statistic_no_coefficients(n_basic):
     n = n_basic
     n.add("Effect", "land_use", unit="ha")
-    with pytest.raises(ValueError, match="no `carrier_attribute`"):
+    with pytest.raises(ValueError, match="no coefficient sources"):
         n.statistics.effect("land_use")
+
+
+# --- per-component coefficients: marginal_effect_* / capital_effect_* ---
+
+
+@pytest.fixture
+def n_direct():
+    n = pypsa.Network(snapshots=pd.date_range("2026-01-01", periods=12, freq="h"))
+    n.add("Carrier", "gas", co2_emissions=0.2)
+    n.add("Carrier", "wind")
+    n.add("Bus", "b")
+    n.add(
+        "Generator",
+        "gas",
+        bus="b",
+        carrier="gas",
+        p_nom=150,
+        marginal_cost=50,
+        efficiency=0.5,
+        marginal_effect_water=1.9,
+    )
+    n.add(
+        "Generator",
+        "wind",
+        bus="b",
+        carrier="wind",
+        marginal_cost=0.1,
+        p_max_pu=0.3 + 0.5 * np.sin(np.linspace(0, 3, 12)) ** 2,
+        p_nom_extendable=True,
+        capital_cost=60,
+        capital_effect_land_use=0.5,
+    )
+    n.add("Load", "load", bus="b", p_set=100.0)
+    n.add("Effect", "water", unit="m3")
+    n.add("Effect", "land_use", unit="ha")
+    return n
+
+
+def test_direct_operational_statistic(n_direct):
+    n = n_direct
+    n.optimize(include_objective_constant=False)
+    manual = float((n.generators_t.p["gas"] * 1.9).sum())
+    assert manual > 0
+    assert_allclose(float(n.statistics.effect("water").sum()), manual, rtol=1e-6)
+
+
+def test_direct_capacity_statistic_and_limit(n_direct):
+    unconstrained = n_direct.copy()
+    unconstrained.optimize(include_objective_constant=False)
+    build = float(unconstrained.generators.p_nom_opt["wind"])
+    assert build > 100  # land cap below is binding
+    assert_allclose(
+        float(unconstrained.statistics.effect("land_use").sum()),
+        0.5 * build,
+        rtol=1e-6,
+    )
+
+    n = n_direct
+    n.add(
+        "GlobalConstraint",
+        "land_cap",
+        type="effect_limit",
+        carrier_attribute="land_use",
+        sense="<=",
+        constant=30.0,
+    )
+    n.optimize(include_objective_constant=False)
+    assert_allclose(float(n.generators.p_nom_opt["wind"]), 60.0, rtol=1e-6)
+    assert_allclose(float(n.statistics.effect("land_use").sum()), 30.0, rtol=1e-6)
+    assert float(n.global_constraints.loc["land_cap", "mu"]) != 0.0
+
+
+def test_direct_capacity_nonextendable_is_constant(n_direct):
+    n_direct.generators.loc["wind", "p_nom_extendable"] = False
+    n_direct.generators.loc["wind", "p_nom"] = 80.0
+    m = n_direct.copy()
+
+    n_direct.optimize(include_objective_constant=False)
+    assert_allclose(
+        float(n_direct.statistics.effect("land_use").sum()), 40.0, rtol=1e-9
+    )
+    # a bound on a purely constant contribution shifts the rhs
+    m.add(
+        "GlobalConstraint",
+        "land_cap",
+        type="effect_limit",
+        carrier_attribute="land_use",
+        sense="<=",
+        constant=50.0,
+    )
+    status, _ = m.optimize(include_objective_constant=False)
+    assert status == "ok"
+
+
+def test_direct_price_equivalent_to_folding(n_direct):
+    a = n_direct.copy()
+    a.generators.loc["gas", "marginal_cost"] += 2.0 * 1.9
+    a.optimize(include_objective_constant=False)
+
+    b = n_direct.copy()
+    b.effects.loc["water", "price"] = 2.0
+    b.optimize(include_objective_constant=False)
+
+    assert_allclose(a.objective, b.objective, rtol=1e-9)
+    assert_allclose(a.generators_t.p.values, b.generators_t.p.values, atol=1e-5)
+
+
+def test_direct_effect_unbounded_stays_out(n_direct):
+    from pypsa.optimization.effects import materialized_effects
+
+    n = n_direct
+    n.optimize(include_objective_constant=False)
+    assert materialized_effects(n) == {"cost"}
+    assert not any(k.startswith("GlobalConstraint") for k in n.model.constraints)
+
+
+def test_direct_mixed_with_carrier_route(n_direct):
+    n = n_direct
+    # co2 via carrier route plus an additional direct co2 coefficient
+    n.add("Effect", "co2", unit="t", carrier_attribute="co2_emissions")
+    n.generators.loc["gas", "marginal_effect_co2"] = 0.05
+    n.optimize(include_objective_constant=False)
+    p_gas = n.generators_t.p["gas"]
+    manual = float((p_gas / 0.5 * 0.2).sum() + (p_gas * 0.05).sum())
+    assert_allclose(float(n.statistics.effect("co2").sum()), manual, rtol=1e-6)

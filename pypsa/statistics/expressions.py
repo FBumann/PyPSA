@@ -1722,7 +1722,12 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
         `carrier_attribute` set, contributions are computed with the same
         semantics as the `primary_energy` global constraint: generator
         output divided by efficiency times the carrier coefficient, plus
-        the depletion of non-cyclic storage units and stores. The result is
+        the depletion of non-cyclic storage units and stores. In addition,
+        per-component coefficient columns contribute:
+        ``marginal_effect_{name}`` per unit of the component's operation
+        (like `marginal_cost`) and ``capital_effect_{name}`` per unit of
+        optimal nominal capacity (like `capital_cost`; included only when
+        aggregating over time, as it has no time dimension). The result is
         available for *all* declared effects, whether or not the effect is
         bounded in the optimization.
 
@@ -1754,59 +1759,113 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
                 f"Available effects: {list(effects.index)}."
             )
             raise ValueError(msg)
+        from pypsa.descriptors import nominal_attrs  # noqa: PLC0415
+        from pypsa.optimization.effects import (  # noqa: PLC0415
+            _has_direct_coefficients,
+            capacity_effect_attr,
+            operational_effect_attr,
+        )
+        from pypsa.optimization.optimize import lookup  # noqa: PLC0415
+
         carrier_attribute = effects.at[name, "carrier_attribute"]
         accounting = effects.at[name, "accounting"]
-        if not carrier_attribute:
+        if not carrier_attribute and not _has_direct_coefficients(self._n, name):
             msg = (
-                f"Effect '{name}' has no `carrier_attribute` set; there are "
-                "no coefficient sources to evaluate."
+                f"Effect '{name}' has no coefficient sources: neither "
+                f"`carrier_attribute` is set nor does any component carry "
+                f"`{operational_effect_attr(name)}` or "
+                f"`{capacity_effect_attr(name)}` columns."
             )
             raise ValueError(msg)
 
         w_flow_col = "generators" if accounting == "physical" else "objective"
+        op_col = operational_effect_attr(name)
+        cap_col = capacity_effect_attr(name)
 
         @pass_empty_series_if_keyerror
         def func(n: Network, c: str, port: str) -> pd.Series:
-            coeffs = n.c.carriers.static[carrier_attribute]
-            if isinstance(coeffs.index, pd.MultiIndex):
-                coeffs = coeffs.groupby(level="name").first()
-            coeffs = coeffs[coeffs != 0]
             static = n.c[c].static
-            assets = static.index[static.carrier.isin(coeffs.index)]
-            if assets.empty:
-                return pd.Series()
-            em = coeffs[static.carrier[assets]].set_axis(assets)
             weights_one = pd.Series(1.0, index=n.snapshots)
+            parts = []
 
-            if c == "Generator":
-                eff = n.get_switchable_as_dense(c, "efficiency")[assets]
-                vals = n.c[c].dynamic["p"][assets] / eff * em
-                weights = n.snapshot_weightings[w_flow_col]
-                return self._aggregate_timeseries(vals, weights, agg=groupby_time)
+            if carrier_attribute and "carrier" in static:
+                coeffs = n.c.carriers.static[carrier_attribute]
+                if isinstance(coeffs.index, pd.MultiIndex):
+                    coeffs = coeffs.groupby(level="name").first()
+                coeffs = coeffs[coeffs != 0]
+                assets = static.index[static.carrier.isin(coeffs.index)]
+                if not assets.empty:
+                    em = coeffs[static.carrier[assets]].set_axis(assets)
 
-            if c == "StorageUnit":
-                sus = static.loc[assets].query("not cyclic_state_of_charge").index
-                if sus.empty:
-                    return pd.Series()
-                soc = n.c[c].dynamic["state_of_charge"][sus]
-                depletion = -soc.diff()
-                depletion.iloc[0] = (
-                    static.loc[sus, "state_of_charge_initial"] - soc.iloc[0]
-                )
-                vals = depletion * em[sus]
-                return self._aggregate_timeseries(vals, weights_one, agg=groupby_time)
+                    if c == "Generator":
+                        eff = n.get_switchable_as_dense(c, "efficiency")[assets]
+                        vals = n.c[c].dynamic["p"][assets] / eff * em
+                        weights = n.snapshot_weightings[w_flow_col]
+                        parts.append(
+                            self._aggregate_timeseries(vals, weights, agg=groupby_time)
+                        )
 
-            if c == "Store":
-                sts = static.loc[assets].query("not e_cyclic").index
-                if sts.empty:
-                    return pd.Series()
-                e = n.c[c].dynamic["e"][sts]
-                depletion = -e.diff()
-                depletion.iloc[0] = static.loc[sts, "e_initial"] - e.iloc[0]
-                vals = depletion * em[sts]
-                return self._aggregate_timeseries(vals, weights_one, agg=groupby_time)
+                    if c == "StorageUnit":
+                        sus = (
+                            static.loc[assets].query("not cyclic_state_of_charge").index
+                        )
+                        if not sus.empty:
+                            soc = n.c[c].dynamic["state_of_charge"][sus]
+                            depletion = -soc.diff()
+                            depletion.iloc[0] = (
+                                static.loc[sus, "state_of_charge_initial"] - soc.iloc[0]
+                            )
+                            vals = depletion * em[sus]
+                            parts.append(
+                                self._aggregate_timeseries(
+                                    vals, weights_one, agg=groupby_time
+                                )
+                            )
 
-            return pd.Series()
+                    if c == "Store":
+                        sts = static.loc[assets].query("not e_cyclic").index
+                        if not sts.empty:
+                            e = n.c[c].dynamic["e"][sts]
+                            depletion = -e.diff()
+                            depletion.iloc[0] = static.loc[sts, "e_initial"] - e.iloc[0]
+                            vals = depletion * em[sts]
+                            parts.append(
+                                self._aggregate_timeseries(
+                                    vals, weights_one, agg=groupby_time
+                                )
+                            )
+
+            marginal_lookup = lookup.query("marginal_cost")
+            if op_col in static.columns and c in marginal_lookup.index.get_level_values(
+                "component"
+            ):
+                attr = marginal_lookup.loc[c].index.item() + port
+                coeff = pd.to_numeric(static[op_col], errors="coerce").fillna(0.0)
+                assets = coeff.index[coeff != 0]
+                if not assets.empty:
+                    vals = n.c[c].dynamic[attr][assets] * coeff[assets]
+                    weights = n.snapshot_weightings[w_flow_col]
+                    parts.append(
+                        self._aggregate_timeseries(vals, weights, agg=groupby_time)
+                    )
+
+            if (
+                cap_col in static.columns
+                and groupby_time is not False
+                and c in nominal_attrs
+            ):
+                coeff = pd.to_numeric(static[cap_col], errors="coerce").fillna(0.0)
+                assets = coeff.index[coeff != 0]
+                if not assets.empty:
+                    nom_attr = nominal_attrs[c]
+                    opt = f"{nom_attr}_opt"
+                    nominal = static[opt] if opt in static else static[nom_attr]
+                    parts.append(coeff[assets] * nominal[assets])
+
+            if not parts:
+                return pd.Series()
+            result = pd.concat(parts)
+            return result.groupby(level=list(range(result.index.nlevels))).sum()
 
         df = self._aggregate_components(
             func,
