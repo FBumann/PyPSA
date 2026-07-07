@@ -602,3 +602,104 @@ def test_direct_mixed_with_carrier_route(n_direct):
     p_gas = n.generators_t.p["gas"]
     manual = float((p_gas / 0.5 * 0.2).sum() + (p_gas * 0.05).sum())
     assert_allclose(float(n.statistics.effect("co2").sum()), manual, rtol=1e-6)
+
+
+# --- dict-form effect kwargs and consistency ---
+
+
+def test_dict_kwarg_equivalent_to_flat_columns():
+    def base():
+        n = pypsa.Network(snapshots=pd.date_range("2026-01-01", periods=6, freq="h"))
+        n.add("Carrier", "gas")
+        n.add("Bus", "b")
+        n.add("Effect", "water", unit="m3")
+        n.add("Effect", "land_use", unit="ha")
+        n.add("Load", "l", bus="b", p_set=60.0)
+        return n
+
+    a = base()
+    a.add(
+        "Generator",
+        "g",
+        bus="b",
+        carrier="gas",
+        p_nom=100,
+        marginal_cost=50,
+        marginal_effect_water=1.9,
+        capital_effect_land_use=0.5,
+    )
+    b = base()
+    b.add(
+        "Generator",
+        "g",
+        bus="b",
+        carrier="gas",
+        p_nom=100,
+        marginal_cost=50,
+        marginal_effect={"water": 1.9},
+        capital_effect={"land_use": 0.5},
+    )
+    cols = ["marginal_effect_water", "capital_effect_land_use"]
+    pd.testing.assert_frame_equal(a.generators[cols], b.generators[cols])
+
+
+def test_dict_kwarg_arbitrary_effect_names(tmp_path):
+    n = pypsa.Network(snapshots=pd.date_range("2026-01-01", periods=6, freq="h"))
+    n.add("Carrier", "gas")
+    n.add("Bus", "b")
+    n.add("Effect", "Water Consumption ABC", unit="m3")
+    n.add(
+        "Generator",
+        "g",
+        bus="b",
+        carrier="gas",
+        p_nom=100,
+        marginal_cost=50,
+        marginal_effect={"Water Consumption ABC": 1.9},
+    )
+    n.add("Load", "l", bus="b", p_set=60.0)
+    n.optimize(include_objective_constant=False)
+    manual = float((n.generators_t.p["g"] * 1.9).sum())
+    assert_allclose(
+        float(n.statistics.effect("Water Consumption ABC").sum()), manual, rtol=1e-6
+    )
+    path = tmp_path / "n.nc"
+    n.export_to_netcdf(path)
+    m = pypsa.Network(path)
+    col = "marginal_effect_Water Consumption ABC"
+    assert float(m.generators.at["g", col]) == 1.9
+
+
+def test_dict_kwarg_undeclared_effect_warns(caplog):
+    n = pypsa.Network()
+    n.add("Bus", "b")
+    with caplog.at_level("WARNING"):
+        n.add("Generator", "g", bus="b", p_nom=10, marginal_effect={"typo": 1.0})
+    assert "not declared in n.effects" in caplog.text
+
+
+def test_dict_kwarg_conflicting_inputs_raises():
+    n = pypsa.Network()
+    n.add("Bus", "b")
+    n.add("Effect", "water", unit="m3")
+    with pytest.raises(ValueError, match="passed both via"):
+        n.add(
+            "Generator",
+            "g",
+            bus="b",
+            p_nom=10,
+            marginal_effect={"water": 1.0},
+            marginal_effect_water=2.0,
+        )
+
+
+def test_consistency_check_orphan_effect_column():
+    from pypsa.consistency import ConsistencyError
+
+    n = pypsa.Network(snapshots=range(2))
+    n.add("Carrier", "gas")
+    n.add("Bus", "b", carrier="gas")
+    n.add("Generator", "g", bus="b", carrier="gas", p_nom=10, marginal_cost=1.0)
+    n.generators["capital_effect_landuse"] = 0.5  # typo: land_use not declared
+    with pytest.raises(ConsistencyError, match="not.*declared in n.effects"):
+        n.consistency_check(strict=["effect_columns"])

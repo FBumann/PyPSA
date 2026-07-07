@@ -105,6 +105,62 @@ def _build_suffixed_names(
     return names.astype(str) + suffix
 
 
+def _expand_effect_coefficients(n: Any, kwargs: dict) -> dict:
+    """Expand dict-valued `marginal_effect`/`capital_effect` kwargs.
+
+    ``n.add(..., capital_effect={"land use": 0.5})`` is sugar for the flat
+    per-effect coefficient column ``capital_effect_land use`` (and likewise
+    `marginal_effect`). The dict form validates effect names against
+    `n.effects` and supports names that are not valid Python identifiers.
+    """
+    from pypsa.optimization.effects import (  # noqa: PLC0415
+        capacity_effect_attr,
+        operational_effect_attr,
+    )
+
+    bases = {
+        "marginal_effect": operational_effect_attr,
+        "capital_effect": capacity_effect_attr,
+    }
+    if not any(base in kwargs for base in bases):
+        return kwargs
+
+    kwargs = dict(kwargs)
+    declared = n.c.effects.static.index
+    if isinstance(declared, pd.MultiIndex):
+        declared = declared.get_level_values("name")
+    declared = set(declared)
+
+    for base, attr_fn in bases.items():
+        if base not in kwargs:
+            continue
+        val = kwargs.pop(base)
+        if not isinstance(val, dict):
+            msg = (
+                f"`{base}` must be a dict mapping effect names to "
+                f"coefficients, got {type(val).__name__}."
+            )
+            raise TypeError(msg)
+        for effect, coeff in val.items():
+            if effect not in declared:
+                logger.warning(
+                    "Effect '%s' (passed via `%s`) is not declared in "
+                    "n.effects; the coefficient stays inert until the "
+                    "effect is added.",
+                    effect,
+                    base,
+                )
+            col = attr_fn(effect)
+            if col in kwargs:
+                msg = (
+                    f"Coefficient for effect '{effect}' passed both via "
+                    f"`{base}` and `{col}`."
+                )
+                raise ValueError(msg)
+            kwargs[col] = coeff
+    return kwargs
+
+
 class NetworkTransformMixin(_NetworkABC):
     """Mixin class for network transform methods.
 
@@ -237,6 +293,9 @@ class NetworkTransformMixin(_NetworkABC):
         if not names.is_unique:
             msg = f"Names for {c.name} must be unique."
             raise ValueError(msg)
+
+        # Expand dict-valued effect coefficient kwargs into flat columns
+        kwargs = _expand_effect_coefficients(self, kwargs)
 
         # Check custom attributes
         standard_attrs = set(c.defaults.index)
