@@ -1,3 +1,5 @@
+> **Superseded:** filed as upstream issue PyPSA/PyPSA#1788 (2026-07-07) instead of a Discussion — see 05-upstream-issue.md for the final text.
+
 # Draft GitHub Discussion post (Ideas)
 
 > Ready to post at github.com/PyPSA/PyPSA/discussions (category: Ideas),
