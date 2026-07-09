@@ -190,7 +190,7 @@ def check_effect_coefficient_columns(
     prefixes = ("marginal_effect_", "capital_effect_")
     cols = [
         col
-        for col in component.static.columns
+        for col in list(component.static.columns) + list(component.dynamic.keys())
         if isinstance(col, str) and col.startswith(prefixes)
     ]
     if not cols:

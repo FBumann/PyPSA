@@ -703,3 +703,93 @@ def test_consistency_check_orphan_effect_column():
     n.generators["capital_effect_landuse"] = 0.5  # typo: land_use not declared
     with pytest.raises(ConsistencyError, match="not.*declared in n.effects"):
         n.consistency_check(strict=["effect_columns"])
+
+
+# --- time-varying per-component coefficients (COP-style series) ---
+
+
+@pytest.fixture
+def n_heatpump():
+    """Heat pump as a Link with a COP(t) green-heat coefficient series."""
+    n = pypsa.Network(snapshots=pd.date_range("2026-01-01", periods=8, freq="h"))
+    n.add("Carrier", "el")
+    n.add("Bus", "el", carrier="el")
+    n.add("Bus", "heat", carrier="el")
+    n.add("Effect", "green_heat", unit="MWh_th")
+    n.add("Generator", "grid", bus="el", p_nom=200, marginal_cost=40)
+    n.add("Generator", "boiler", bus="heat", p_nom=100, marginal_cost=10)
+    cop = pd.Series(3.0 + 0.4 * np.sin(np.arange(8)), index=n.snapshots)
+    n.add(
+        "Link",
+        "hp",
+        bus0="el",
+        bus1="heat",
+        p_nom=50,
+        efficiency=cop,
+        marginal_effect={"green_heat": cop},
+    )
+    n.add("Load", "heat demand", bus="heat", p_set=80.0)
+    return n
+
+
+def test_series_coefficient_statistic(n_heatpump):
+    n = n_heatpump
+    n.generators.loc["boiler", "marginal_cost"] = 45  # make the hp run
+    n.optimize(include_objective_constant=False)
+    manual = float(
+        (n.links_t.p0["hp"] * n.links_t["marginal_effect_green_heat"]["hp"]).sum()
+    )
+    assert manual > 0
+    assert_allclose(float(n.statistics.effect("green_heat").sum()), manual, rtol=1e-6)
+
+
+def test_series_coefficient_in_effect_limit(n_heatpump):
+    n = n_heatpump
+    # the boiler is cheaper per MWh of heat (10 vs ~40/COP ~ 13), so the
+    # heat pump only runs because the green-heat floor forces it
+    n.add(
+        "GlobalConstraint",
+        "green_heat_floor",
+        type="effect_limit",
+        carrier_attribute="green_heat",
+        sense=">=",
+        constant=300.0,
+    )
+    n.optimize(include_objective_constant=False)
+    produced = float(n.statistics.effect("green_heat").sum())
+    assert_allclose(produced, 300.0, rtol=1e-6)
+    assert float(n.global_constraints.loc["green_heat_floor", "mu"]) != 0.0
+
+
+def test_series_coefficient_overrides_static(n_heatpump):
+    n = n_heatpump
+    n.generators.loc["boiler", "marginal_cost"] = 45  # make the hp run
+    # static default on the column plus a series override for the same asset:
+    # the series must win (marginal_cost semantics)
+    n.links["marginal_effect_green_heat"] = 99.0
+    n.optimize(include_objective_constant=False)
+    manual = float(
+        (n.links_t.p0["hp"] * n.links_t["marginal_effect_green_heat"]["hp"]).sum()
+    )
+    assert_allclose(float(n.statistics.effect("green_heat").sum()), manual, rtol=1e-6)
+
+
+def test_series_coefficient_io_roundtrip(n_heatpump, tmp_path):
+    n = n_heatpump
+    path = tmp_path / "n.nc"
+    n.export_to_netcdf(path)
+    m = pypsa.Network(path)
+    pd.testing.assert_frame_equal(
+        m.links_t["marginal_effect_green_heat"],
+        n.links_t["marginal_effect_green_heat"],
+        check_freq=False,
+    )
+
+
+def test_consistency_flags_orphan_dynamic_key(n_heatpump):
+    from pypsa.consistency import ConsistencyError
+
+    n = n_heatpump
+    n.links_t["marginal_effect_typo"] = n.links_t["marginal_effect_green_heat"]
+    with pytest.raises(ConsistencyError, match="not.*declared in n.effects"):
+        n.consistency_check(strict=["effect_columns"])

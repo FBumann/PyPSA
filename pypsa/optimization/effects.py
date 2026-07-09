@@ -63,9 +63,47 @@ def _has_direct_coefficients(n: Network, effect: str) -> bool:
     cols = {operational_effect_attr(effect), capacity_effect_attr(effect)}
     return any(
         not cols.isdisjoint(n.c[c].static.columns)
+        or operational_effect_attr(effect) in n.c[c].dynamic
         for c in n.all_components
         if not n.c[c].static.empty
     )
+
+
+def _dense_operational_coefficients(
+    c: Any, col: str, sns: pd.Index
+) -> pd.DataFrame | None:
+    """Combine static and time-varying operational effect coefficients.
+
+    Mirrors `marginal_cost` semantics: the static column provides the
+    per-asset default, a DataFrame under the same key in the dynamic dict
+    overrides it per snapshot (and may cover assets with no static value).
+    Returns a dense (snapshot x asset) frame of nonzero coefficients, or
+    None.
+    """
+    static = c.static.get(col)
+    parts = None
+    if static is not None:
+        coeff = pd.to_numeric(static, errors="coerce").fillna(0.0)
+        coeff = coeff[coeff != 0]
+        if not coeff.empty:
+            parts = pd.DataFrame(
+                np.repeat(coeff.values[None, :], len(sns), axis=0),
+                index=sns,
+                columns=coeff.index,
+            )
+    dynamic = c.dynamic.get(col)
+    if dynamic is not None and not dynamic.empty:
+        dynamic = dynamic.reindex(sns).fillna(0.0)
+        if parts is None:
+            parts = dynamic
+        else:
+            parts = parts.drop(
+                columns=dynamic.columns.intersection(parts.columns)
+            ).join(dynamic)
+    if parts is None:
+        return None
+    parts = parts.loc[:, (parts != 0).any()]
+    return None if parts.empty else parts.rename_axis(columns="name")
 
 
 def _direct_effect_terms(
@@ -79,10 +117,13 @@ def _direct_effect_terms(
 
     Reads ``marginal_effect_{effect}`` (per unit of the component's
     operational variable, snapshot-weighted like the corresponding
-    `marginal_cost` term) and ``capital_effect_{effect}`` (per unit of
-    nominal capacity and active period, like the `capital_cost` term but
-    without annuitization). Contributions of non-extendable capacity are
-    constants and returned separately.
+    `marginal_cost` term; static or series — a DataFrame under the same
+    key in the dynamic dict overrides the static column per snapshot, e.g.
+    a COP(t) series for heat output per unit electricity of one heat pump)
+    and ``capital_effect_{effect}`` (per unit of nominal capacity and
+    active period, like the `capital_cost` term but without
+    annuitization; static only). Contributions of non-extendable capacity
+    are constants and returned separately.
     """
     from pypsa.optimization.optimize import lookup  # noqa: PLC0415
 
@@ -103,17 +144,15 @@ def _direct_effect_terms(
     op_col = operational_effect_attr(effect)
     for c_name, attr in lookup.query("marginal_cost").index:
         c = n.c[c_name]
-        if c.static.empty or op_col not in c.static.columns:
+        if c.static.empty:
             continue
-        coeff = pd.to_numeric(c.static[op_col], errors="coerce").fillna(0.0)
-        assets = coeff.index[coeff != 0].difference(c.inactive_assets)
+        dense = _dense_operational_coefficients(c, op_col, sns)
+        if dense is None:
+            continue
+        assets = dense.columns.difference(c.inactive_assets)
         if assets.empty:
             continue
-        em = pd.DataFrame(
-            np.outer(weighting.values, coeff[assets].values),
-            index=sns,
-            columns=assets,
-        ).rename_axis(columns="name")
+        em = dense[assets].mul(weighting, axis=0)
         var = m[f"{c_name}-{attr}"].sel(name=assets, snapshot=sns)
         terms.append((var * em).sum())
 

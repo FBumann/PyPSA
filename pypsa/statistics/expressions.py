@@ -1761,6 +1761,7 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
             raise ValueError(msg)
         from pypsa.descriptors import nominal_attrs  # noqa: PLC0415
         from pypsa.optimization.effects import (  # noqa: PLC0415
+            _dense_operational_coefficients,
             _has_direct_coefficients,
             capacity_effect_attr,
             operational_effect_attr,
@@ -1836,14 +1837,12 @@ class StatisticsAccessor(AbstractStatisticsAccessor):
                             )
 
             marginal_lookup = lookup.query("marginal_cost")
-            if op_col in static.columns and c in marginal_lookup.index.get_level_values(
-                "component"
-            ):
-                attr = marginal_lookup.loc[c].index.item() + port
-                coeff = pd.to_numeric(static[op_col], errors="coerce").fillna(0.0)
-                assets = coeff.index[coeff != 0]
-                if not assets.empty:
-                    vals = n.c[c].dynamic[attr][assets] * coeff[assets]
+            if c in marginal_lookup.index.get_level_values("component"):
+                dense = _dense_operational_coefficients(n.c[c], op_col, n.snapshots)
+                if dense is not None:
+                    attr = marginal_lookup.loc[c].index.item() + port
+                    assets = dense.columns
+                    vals = n.c[c].dynamic[attr][assets] * dense
                     weights = n.snapshot_weightings[w_flow_col]
                     parts.append(
                         self._aggregate_timeseries(vals, weights, agg=groupby_time)
