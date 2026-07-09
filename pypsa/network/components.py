@@ -191,6 +191,21 @@ class NetworkComponentsMixin(_NetworkABC):
         self.c.carriers.static = value
 
     @property
+    def effects(self) -> Any:
+        """Access to static data of [pypsa.components.Effects][]."""
+        return (
+            self.c.effects.static
+            if not options.api.new_components_api
+            else self.c.effects
+        )
+
+    @effects.setter
+    def effects(self, value: pd.DataFrame) -> None:
+        if options.api.new_components_api:
+            raise AttributeError(_STATIC_SETTER_WARNING)
+        self.c.effects.static = value
+
+    @property
     def global_constraints(self) -> Any:
         """Access to static data of [pypsa.components.GlobalConstraints][]."""
         return (
@@ -590,6 +605,27 @@ class NetworkComponentsMixin(_NetworkABC):
         self.c.loads.dynamic = value
 
     @property
+    def effects_t(self) -> Dict:
+        """Access to dynamic data of [pypsa.components.Effects][]."""
+        if options.api.new_components_api:
+            warnings.warn(
+                _DYNAMIC_GETTER_WARNING.format("effects"),
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return self.c.effects.dynamic
+
+    @effects_t.setter
+    def effects_t(self, value: Dict) -> None:
+        if options.api.new_components_api:
+            warnings.warn(
+                _DYNAMIC_SETTER_WARNING.format("effects"),
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.c.effects.dynamic = value
+
+    @property
     def generators_t(self) -> Dict:
         """Access to dynamic data of [pypsa.components.Generators][]."""
         if options.api.new_components_api:
@@ -785,11 +821,12 @@ class NetworkComponentsMixin(_NetworkABC):
         Examples
         --------
         >>> sorted(n.all_components)
-        ['Bus', 'Carrier', 'Generator', 'GlobalConstraint', 'Line', 'LineType', 'Link', 'Load', 'Process', 'Shape', 'ShuntImpedance', 'StorageUnit', 'Store', 'SubNetwork', 'Transformer', 'TransformerType']
+        ['Bus', 'Carrier', 'Effect', 'Generator', 'GlobalConstraint', 'Line', 'LineType', 'Link', 'Load', 'Process', 'Shape', 'ShuntImpedance', 'StorageUnit', 'Store', 'SubNetwork', 'Transformer', 'TransformerType']
 
         """
         return {
             "Carrier",
+            "Effect",
             "Line",
             "Transformer",
             "Shape",

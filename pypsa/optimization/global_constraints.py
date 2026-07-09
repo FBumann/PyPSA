@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 from linopy.expressions import merge
@@ -269,6 +269,155 @@ def define_growth_limit(n: Network, sns: pd.Index) -> None:
     m.add_constraints(lhs, "<=", rhs, name="Carrier-growth_limit")
 
 
+def _carrier_contribution_terms(
+    n: Network,
+    m: Any,
+    emissions: pd.Series,
+    sns: pd.Index,
+    sns_sel: Any,
+    weightings: pd.DataFrame,
+    period: Any,
+    scenario: Any,
+    period_weighting: pd.Series | None = None,
+    storage_weightings: pd.Series | None = None,
+    period_last_sns: pd.MultiIndex | None = None,
+    flow_weight_col: str = "generators",
+) -> list:
+    """Accumulate carrier-coefficient contributions into expression terms.
+
+    Builds the linopy expression terms of a quantity defined by per-carrier
+    coefficients (`emissions`): generator output divided by efficiency times
+    the coefficient (snapshot-weighted with `flow_weight_col`), plus the
+    depletion of non-cyclic storage units and stores. Shared by
+    [define_primary_energy_limit][pypsa.optimization.global_constraints.define_primary_energy_limit]
+    and effect expressions.
+    """
+    lhs = []
+
+    # generators
+    gens = n.c.generators.static[n.c.generators.static.carrier.isin(emissions.index)]
+    gens = n.c.generators.filter_by_active_assets(gens, period)
+
+    if not gens.empty:
+        gens = gens.loc[scenario]
+        efficiency = (
+            n.c.generators._as_dynamic("efficiency")
+            .loc[:, scenario]
+            .loc[sns[sns_sel], gens.index]
+        )
+        em_pu = gens.carrier.map(emissions) / efficiency
+        em_pu = em_pu.multiply(weightings[flow_weight_col][sns_sel], axis=0)
+
+        p = m["Generator-p"].sel(name=gens.index, snapshot=sns[sns_sel])
+
+        if n.has_scenarios:
+            p = p.sel(scenario=scenario, drop=True)
+
+        expr = (p * em_pu).sum()
+        lhs.append(expr)
+
+    # storage units
+    cond = "carrier in @emissions.index and not cyclic_state_of_charge"
+    sus = n.c.storage_units.static.query(cond)
+    sus = n.c.storage_units.filter_by_active_assets(sus, period)
+    if not sus.empty:
+        sus = sus.loc[scenario]
+        em_pu = sus.carrier.map(emissions)
+        soc = m["StorageUnit-state_of_charge"].sel(name=sus.index, snapshot=sns[sns_sel])
+
+        if n._multi_invest:
+            sus_continuous = sus.query("not state_of_charge_initial_per_period")
+            if not sus_continuous.empty and period_weighting.ne(1).any():
+                msg = (
+                    "Found non-cyclic storage units with associated carrier emissions "
+                    "and continuous depletion over multiple investment periods "
+                    "combined with investment period year weightings != 1. "
+                    "The primary energy constraint will be inconsistent. "
+                    "Please consider setting `state_of_charge_initial_per_period` to True, "
+                    "using equal period weightings or a cyclic storage unit instead."
+                )
+                raise NotImplementedError(msg)
+
+            if not sus_continuous.empty and period_weighting.eq(1).all():
+                soc_final = (
+                    soc.sel(name=sus_continuous.index)
+                    .ffill("snapshot")
+                    .isel(snapshot=-1)
+                )
+                if n.has_scenarios:
+                    soc_final = soc_final.sel(scenario=scenario, drop=True)
+                lhs.append(
+                    (soc_final * -em_pu).sum()
+                    + em_pu @ sus_continuous.state_of_charge_initial
+                )
+
+            sus_per_period = sus.query("state_of_charge_initial_per_period")
+            if not sus_per_period.empty:
+                soc_final = soc.loc[period_last_sns, sus_per_period.index]
+                if n.has_scenarios:
+                    soc_final = soc_final.sel(scenario=scenario, drop=True)
+                soc_delta = -soc_final + sus_per_period.state_of_charge_initial
+                lhs.append((soc_delta * storage_weightings * em_pu).sum())
+
+        else:
+            soc_final = soc.ffill("snapshot").isel(snapshot=-1)
+            if n.has_scenarios:
+                soc_final = soc_final.sel(scenario=scenario, drop=True)
+            lhs.append(
+                (soc_final * -em_pu).sum() + em_pu @ sus.state_of_charge_initial
+            )
+
+    # stores
+    stores = n.c.stores.static.query("carrier in @emissions.index and not e_cyclic")
+    stores = n.c.stores.filter_by_active_assets(stores, period)
+    if not stores.empty:
+        stores = stores.loc[scenario]
+        em_pu = stores.carrier.map(emissions)
+        e = m["Store-e"].sel(name=stores.index, snapshot=sns[sns_sel])
+
+        if n._multi_invest:
+            stores_continuous = stores.query("not e_initial_per_period")
+            if not stores_continuous.empty and period_weighting.ne(1).any():
+                msg = (
+                    "Found non-cyclic stores with associated carrier emissions "
+                    "and continuous depletion over multiple investment periods "
+                    "combined with investment period year weightings != 1. "
+                    "The primary energy constraint will be inconsistent. "
+                    "Please consider setting `e_initial_per_period` to True, "
+                    "using equal period weightings or a cyclic store instead."
+                )
+                raise NotImplementedError(msg)
+
+            if not stores_continuous.empty and period_weighting.eq(1).all():
+                e_final = (
+                    e.sel(name=stores_continuous.index)
+                    .ffill("snapshot")
+                    .isel(snapshot=-1)
+                )
+                if n.has_scenarios:
+                    e_final = e_final.sel(scenario=scenario, drop=True)
+                lhs.append(
+                    (e_final * -em_pu).sum()
+                    + em_pu @ stores_continuous.e_initial
+                )
+
+            stores_per_period = stores.query("e_initial_per_period")
+            if not stores_per_period.empty:
+                e_final = e.loc[period_last_sns, stores_per_period.index]
+                if n.has_scenarios:
+                    e_final = e_final.sel(scenario=scenario, drop=True)
+                e_delta = -e_final + stores_per_period.e_initial
+                lhs.append((e_delta * storage_weightings * em_pu).sum())
+
+        else:
+            e_final = e.ffill("snapshot").isel(snapshot=-1)
+            if n.has_scenarios:
+                e_final = e_final.sel(scenario=scenario, drop=True)
+            lhs.append((e_final * -em_pu).sum() + em_pu @ stores.e_initial)
+
+    return lhs
+
+
 def define_primary_energy_limit(n: Network, sns: pd.Index) -> None:
     """Define primary energy constraints.
 
@@ -318,7 +467,6 @@ def define_primary_energy_limit(n: Network, sns: pd.Index) -> None:
             else:
                 continue
 
-            lhs = []
             emissions = n.c.carriers.static[glc.carrier_attribute][
                 lambda ds: ds != 0
             ].loc[scenario]
@@ -329,132 +477,19 @@ def define_primary_energy_limit(n: Network, sns: pd.Index) -> None:
             # Determine investment period for active asset filtering
             period = glc.investment_period if n._multi_invest else None
 
-            # generators
-            gens = n.c.generators.static[
-                n.c.generators.static.carrier.isin(emissions.index)
-            ]
-            gens = n.c.generators.filter_by_active_assets(gens, period)
-
-            if not gens.empty:
-                gens = gens.loc[scenario]
-                efficiency = (
-                    n.c.generators._as_dynamic("efficiency")
-                    .loc[:, scenario]
-                    .loc[sns[sns_sel], gens.index]
-                )
-                em_pu = gens.carrier.map(emissions) / efficiency
-                em_pu = em_pu.multiply(weightings.generators[sns_sel], axis=0)
-
-                p = m["Generator-p"].sel(name=gens.index, snapshot=sns[sns_sel])
-
-                if n.has_scenarios:
-                    p = p.sel(scenario=scenario, drop=True)
-
-                expr = (p * em_pu).sum()
-                lhs.append(expr)
-
-            # storage units
-            cond = "carrier in @emissions.index and not cyclic_state_of_charge"
-            sus = n.c.storage_units.static.query(cond)
-            sus = n.c.storage_units.filter_by_active_assets(sus, period)
-            if not sus.empty:
-                sus = sus.loc[scenario]
-                em_pu = sus.carrier.map(emissions)
-                soc = m["StorageUnit-state_of_charge"].sel(
-                    name=sus.index, snapshot=sns[sns_sel]
-                )
-
-                if n._multi_invest:
-                    sus_continuous = sus.query("not state_of_charge_initial_per_period")
-                    if not sus_continuous.empty and period_weighting.ne(1).any():
-                        msg = (
-                            "Found non-cyclic storage units with associated carrier emissions "
-                            "and continuous depletion over multiple investment periods "
-                            "combined with investment period year weightings != 1. "
-                            "The primary energy constraint will be inconsistent. "
-                            "Please consider setting `state_of_charge_initial_per_period` to True, "
-                            "using equal period weightings or a cyclic storage unit instead."
-                        )
-                        raise NotImplementedError(msg)
-
-                    if not sus_continuous.empty and period_weighting.eq(1).all():
-                        soc_final = (
-                            soc.sel(name=sus_continuous.index)
-                            .ffill("snapshot")
-                            .isel(snapshot=-1)
-                        )
-                        if n.has_scenarios:
-                            soc_final = soc_final.sel(scenario=scenario, drop=True)
-                        lhs.append(
-                            (soc_final * -em_pu).sum()
-                            + em_pu @ sus_continuous.state_of_charge_initial
-                        )
-
-                    sus_per_period = sus.query("state_of_charge_initial_per_period")
-                    if not sus_per_period.empty:
-                        soc_final = soc.loc[period_last_sns, sus_per_period.index]
-                        if n.has_scenarios:
-                            soc_final = soc_final.sel(scenario=scenario, drop=True)
-                        soc_delta = -soc_final + sus_per_period.state_of_charge_initial
-                        lhs.append((soc_delta * storage_weightings * em_pu).sum())
-
-                else:
-                    soc_final = soc.ffill("snapshot").isel(snapshot=-1)
-                    if n.has_scenarios:
-                        soc_final = soc_final.sel(scenario=scenario, drop=True)
-                    lhs.append(
-                        (soc_final * -em_pu).sum() + em_pu @ sus.state_of_charge_initial
-                    )
-
-            # stores
-            stores = n.c.stores.static.query(
-                "carrier in @emissions.index and not e_cyclic"
+            lhs = _carrier_contribution_terms(
+                n,
+                m,
+                emissions,
+                sns,
+                sns_sel,
+                weightings,
+                period,
+                scenario,
+                period_weighting=period_weighting if n._multi_invest else None,
+                storage_weightings=storage_weightings if n._multi_invest else None,
+                period_last_sns=period_last_sns if n._multi_invest else None,
             )
-            stores = n.c.stores.filter_by_active_assets(stores, period)
-            if not stores.empty:
-                stores = stores.loc[scenario]
-                em_pu = stores.carrier.map(emissions)
-                e = m["Store-e"].sel(name=stores.index, snapshot=sns[sns_sel])
-
-                if n._multi_invest:
-                    stores_continuous = stores.query("not e_initial_per_period")
-                    if not stores_continuous.empty and period_weighting.ne(1).any():
-                        msg = (
-                            "Found non-cyclic stores with associated carrier emissions "
-                            "and continuous depletion over multiple investment periods "
-                            "combined with investment period year weightings != 1. "
-                            "The primary energy constraint will be inconsistent. "
-                            "Please consider setting `e_initial_per_period` to True, "
-                            "using equal period weightings or a cyclic store instead."
-                        )
-                        raise NotImplementedError(msg)
-
-                    if not stores_continuous.empty and period_weighting.eq(1).all():
-                        e_final = (
-                            e.sel(name=stores_continuous.index)
-                            .ffill("snapshot")
-                            .isel(snapshot=-1)
-                        )
-                        if n.has_scenarios:
-                            e_final = e_final.sel(scenario=scenario, drop=True)
-                        lhs.append(
-                            (e_final * -em_pu).sum()
-                            + em_pu @ stores_continuous.e_initial
-                        )
-
-                    stores_per_period = stores.query("e_initial_per_period")
-                    if not stores_per_period.empty:
-                        e_final = e.loc[period_last_sns, stores_per_period.index]
-                        if n.has_scenarios:
-                            e_final = e_final.sel(scenario=scenario, drop=True)
-                        e_delta = -e_final + stores_per_period.e_initial
-                        lhs.append((e_delta * storage_weightings * em_pu).sum())
-
-                else:
-                    e_final = e.ffill("snapshot").isel(snapshot=-1)
-                    if n.has_scenarios:
-                        e_final = e_final.sel(scenario=scenario, drop=True)
-                    lhs.append((e_final * -em_pu).sum() + em_pu @ stores.e_initial)
 
             if not lhs:
                 continue

@@ -161,6 +161,55 @@ def check_for_unknown_carriers(
             )
 
 
+def check_effect_coefficient_columns(
+    n: NetworkType, component: Components, strict: bool = False
+) -> None:
+    """Check that effect coefficient columns reference declared effects.
+
+    Columns matching ``marginal_effect_{name}`` / ``capital_effect_{name}``
+    contribute to the effect ``{name}``; if that effect is not declared in
+    `n.effects`, the column is silently inert — usually a typo.
+
+    Activate strict mode in general consistency check by passing
+    `['effect_columns']` to the `strict` argument.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        The network to check.
+    component : pypsa.Component
+        The component to check.
+    strict : bool, optional
+        If True, raise an error instead of logging a warning.
+
+    See Also
+    --------
+    [pypsa.Network.consistency_check][]
+
+    """
+    prefixes = ("marginal_effect_", "capital_effect_")
+    cols = [
+        col
+        for col in list(component.static.columns) + list(component.dynamic.keys())
+        if isinstance(col, str) and col.startswith(prefixes)
+    ]
+    if not cols:
+        return
+    declared = n.c.effects.static.index
+    if isinstance(declared, pd.MultiIndex):
+        declared = declared.get_level_values("name")
+    declared_set = set(declared)
+    unknown = [col for col in cols if col.split("_effect_", 1)[1] not in declared_set]
+    if unknown:
+        _log_or_raise(
+            strict,
+            "The following columns of %s reference effects which are not "
+            "declared in n.effects and stay inert until they are added: %s",
+            component.list_name,
+            unknown,
+        )
+
+
 def check_for_zero_impedances(
     n: NetworkType, component: Components, strict: bool = False
 ) -> None:
@@ -902,6 +951,7 @@ class NetworkConsistencyMixin(_NetworkABC):
         strict_options = [
             "unknown_buses",
             "unknown_carriers",
+            "effect_columns",
             "time_series",
             "static_power_attrs",
             "time_series_power_attrs",
@@ -942,6 +992,7 @@ class NetworkConsistencyMixin(_NetworkABC):
             # Checks all components
             check_for_unknown_buses(self, c, "unknown_buses" in strict)
             check_for_unknown_carriers(self, c, "unknown_carriers" in strict)
+            check_effect_coefficient_columns(self, c, "effect_columns" in strict)
             check_time_series(self, c, "time_series" in strict)
             check_static_power_attributes(self, c, "static_power_attrs" in strict)
             check_time_series_power_attributes(

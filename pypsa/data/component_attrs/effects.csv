@@ -1,0 +1,6 @@
+attribute,type,unit,default,description,status
+name,string,n/a,n/a,Unique name,Input (required)
+unit,string,n/a,,"Unit of the tracked quantity (e.g. EUR, tCO2, ha). Descriptive only, never used in calculations.",Input (optional)
+accounting,string,n/a,physical,"Weighting scheme for aggregating contributions over snapshots and investment periods: ""physical"" uses the `generators`/`stores` snapshot weightings and the `years` investment period weighting (like the `primary_energy` global constraint); ""cost"" uses the `objective` weightings (like the cost objective).",Input (optional)
+carrier_attribute,string,n/a,,"If set, per-flow-hour contributions are derived from this column of `n.carriers` with the same semantics as the `primary_energy` global constraint (generator output divided by efficiency, non-cyclic storage depletion).",Input (optional)
+price,static or series,currency/unit,0,"Price routing this effect's value into the objective (e.g. a CO2 price in currency per tCO2). Applied with `objective` weightings, mirroring emission-price folding into marginal costs.",Input (optional)
